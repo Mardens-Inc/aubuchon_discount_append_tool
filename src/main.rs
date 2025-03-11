@@ -35,8 +35,11 @@ async fn main() -> Result<()> {
 
 fn load_csv_values() -> Result<Vec<CSVRow>> {
     let mut results = vec![];
-    let mut file = csv::Reader::from_path("file.csv")?;
-    for result in file.deserialize::<CSVRow>() {
+    let vartext = include_str!("../file.csv");
+    let mut rdr = csv::ReaderBuilder::new()
+    .has_headers(true)
+    .from_reader(vartext.as_bytes());
+    for result in rdr.deserialize::<CSVRow>() {
         let result = result?;
         if !result.discount.is_empty() {
             results.push(result);
@@ -63,46 +66,67 @@ async fn upload_to_database(rows: Vec<CSVRow>) -> Result<()> {
     let config = DatabaseConnectionData::get().await?;
     let pool = create_pool(&config).await?;
 
-    // Use tokio's stream processing or a bounded concurrent task approach
-    use futures::stream::{self, StreamExt};
+    // Set batch size for grouping queries
+    let batch_size = 500; // Adjust based on your database capabilities and data size
 
-    // Process in batches with controlled concurrency
-    let concurrency_limit = 50; // Adjust based on your system capabilities
+    // Process rows in batches
+    for chunk in rows.chunks(batch_size) {
+        // Build a batch query with parameters for all rows in this chunk
+        let mut query_builder = sqlx::QueryBuilder::new(
+            "UPDATE `DQ8weMwxbW` SET mp = CASE prodaltkey "
+        );
 
-    let results = stream::iter(rows)
-        .map(|row| {
-            let pool = pool.clone();
-            async move {
-                if let Some(mardens_price) = row.mardens_price {
-                    match sqlx::query(
-                        r#"UPDATE `DQ8weMwxbW` SET mp = ?, discount_code = ? WHERE prodaltkey = ?"#,
-                    )
-                    .bind(mardens_price)
-                    .bind(&row.discount)
-                    .bind(&row.upc)
-                    .execute(&pool)
-                    .await
-                    {
-                        Ok(_) => Ok(()),
-                        Err(e) => {
-                            error!("Error updating database for UPC {}: {}", row.upc, e);
-                            Err(e)
-                        }
-                    }
-                } else {
-                    Ok(())
-                }
+        // Add WHEN/THEN clauses for each row with mardens_price
+        let mut params = Vec::new();
+        let mut discount_updates = Vec::new();
+        let mut has_valid_rows = false;
+
+        for row in chunk {
+            if let Some(mardens_price) = row.mardens_price {
+                has_valid_rows = true;
+                query_builder.push(" WHEN ");
+                query_builder.push_bind(&row.upc);
+                query_builder.push(" THEN ");
+                query_builder.push_bind(mardens_price);
+
+                params.push(&row.upc);
+                discount_updates.push((row.upc.clone(), row.discount.clone()));
             }
-        })
-        .buffer_unordered(concurrency_limit) // Process up to concurrency_limit tasks in parallel
-        .collect::<Vec<_>>()
-        .await;
+        }
 
-    // Check for errors if needed
-    for result in results {
-        if let Err(e) = result {
-            // Handle or log errors
-            error!("Task error: {}", e);
+        // Skip if no valid rows in this batch
+        if !has_valid_rows {
+            continue;
+        }
+
+        // Complete the price update
+        query_builder.push(" END, discount_code = CASE prodaltkey ");
+
+        // Add WHEN/THEN clauses for discount codes
+        for (upc, discount) in &discount_updates {
+            query_builder.push(" WHEN ");
+            query_builder.push_bind(upc);
+            query_builder.push(" THEN ");
+            query_builder.push_bind(discount);
+        }
+
+        // Finalize query with WHERE clause for all relevant UPCs
+        query_builder.push(" END WHERE prodaltkey IN (");
+        let mut separated = query_builder.separated(", ");
+        for upc in params {
+            separated.push_bind(upc);
+        }
+        separated.push_unseparated(")");
+
+        // Execute the batch query
+        match query_builder.build().execute(&pool).await {
+            Ok(result) => {
+                info!("Batch update succeeded: {} rows affected", result.rows_affected());
+            },
+            Err(e) => {
+                error!("Error with batch update: {}", e);
+                return Err(anyhow::anyhow!("Database batch update failed: {}", e));
+            }
         }
     }
 
